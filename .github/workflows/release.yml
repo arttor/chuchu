@@ -15,41 +15,61 @@ jobs:
   release:
     permissions:
       contents: write
-      id-token: write
     runs-on: ubuntu-latest
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: nix shell
-        run: nix develop -L --verbose
-
-      - name: parse version from tag
+      - name: Validate release tag
         id: version
-        if: ${{ github.ref_type == 'tag' || inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
         run: |
-          set -e
-          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}"
-          VERSION="${TAG#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Tag '$TAG' is not a valid semver (expected MAJOR.MINOR.PATCH, optionally prefixed with 'v')"
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+          if ! [[ "$TAG" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo '::error::Release tag must be vMAJOR.MINOR.PATCH (or MAJOR.MINOR.PATCH)'
             exit 1
           fi
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
           for COMPONENT in "$MAJOR" "$MINOR" "$PATCH"; do
-            if [ "$COMPONENT" -gt 99 ]; then
-              echo "::error::Version component '$COMPONENT' exceeds 99 (MMmmpp scheme limit)"
+            if (( 10#$COMPONENT > 99 )); then
+              echo '::error::Version components must be at most 99'
               exit 1
             fi
           done
-          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
-          echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
-          echo "patch=$PATCH" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Parsed version: $VERSION (major=$MAJOR minor=$MINOR patch=$PATCH)"
+          {
+            echo "tag=$TAG"
+            echo "major=$MAJOR"
+            echo "minor=$MINOR"
+            echo "patch=$PATCH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checked-out tag
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          if [[ "$TAG_COMMIT" != "$(git rev-parse HEAD)" ]]; then
+            echo '::error::Checkout does not match the requested release tag'
+            exit 1
+          fi
+
+      - name: Install Nix
+        run: bash .github/install-nix.sh
+
+      - name: nix shell
+        run: nix develop -L --verbose
 
       - name: build chuchu_jni
         run: |
@@ -59,12 +79,9 @@ jobs:
             zig build -Doptimize=ReleaseSmall -Dtarget=aarch64-linux-android.24 jni
           '
 
-      - name: generate release key
-        run: |
-          cd android/app/ && echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > key.jks
-
       - name: build android release artifacts (APK + AAB)
         env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
@@ -73,23 +90,35 @@ jobs:
           VERSION_PATCH: ${{ steps.version.outputs.patch }}
           ANDROID_ABI_FILTERS: arm64-v8a
         run: |
+          set -euo pipefail
+          umask 077
+          trap 'rm -f android/app/key.jks' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/key.jks
           nix develop -c bash -c '
-            set -e
+            set -euo pipefail
             cd android
             chmod +x ./gradlew
             if [ -f local.properties ]; then chmod -w local.properties; fi
-            ./gradlew assembleRelease bundleRelease
+            ./gradlew testDebugUnitTest lintDebug assembleRelease bundleRelease
           '
 
-      - name: upload release
-        if: ${{ github.ref_type == 'tag' || inputs.release_tag != '' }}
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
-          target_commitish: ${{ github.sha }}
-          draft: true
-          files: |
-            ./android/app/build/outputs/apk/release/*.apk
-            ./android/app/build/outputs/bundle/release/*.aab
-          fail_on_unmatched_files: true
-
+      - name: Upload draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(./android/app/build/outputs/apk/release/*.apk)
+          aabs=(./android/app/build/outputs/bundle/release/*.aab)
+          if (( ${#apks[@]} == 0 || ${#aabs[@]} == 0 )); then
+            echo '::error::Expected both release APK and AAB'
+            exit 1
+          fi
+          artifacts=("${apks[@]}" "${aabs[@]}")
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --draft --verify-tag
+            gh release upload "$RELEASE_TAG" "${artifacts[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${artifacts[@]}" --draft --verify-tag
+          fi
