@@ -447,6 +447,7 @@ fun TerminalScreen(
     var showPassphrasePrompt by remember { mutableStateOf(false) }
     var passphraseInput by remember { mutableStateOf("") }
     var pendingTabSpec by remember { mutableStateOf<TabSpec?>(null) }
+    var pendingReconnect by remember { mutableStateOf<TerminalViewModel.PreparedReconnect?>(null) }
     var passphraseFromPicker by remember { mutableStateOf(false) }
     var showTabSheet by remember { mutableStateOf(false) }
     var showGlobalTabManager by remember { mutableStateOf(false) }
@@ -520,6 +521,7 @@ fun TerminalScreen(
         showPassphrasePrompt = false
         passphraseInput = ""
         pendingTabSpec = null
+        pendingReconnect = null
         passphraseFromPicker = false
         val existing = vm.selectLocalShellTab()
         if (existing != null) {
@@ -567,6 +569,11 @@ fun TerminalScreen(
     val pickerScope = rememberCoroutineScope()
 
     val openPreparedTab: (TabSpec, Boolean, Boolean) -> Unit = { spec, requiresVerification, fromPicker ->
+        showPassphrasePrompt = false
+        pendingTabSpec = null
+        pendingReconnect = null
+        passphraseInput = ""
+        passphraseFromPicker = false
         val openOrPrompt: (TabSpec) -> Unit = { preparedSpec ->
             if (
                 preparedSpec.authMethod == AuthMethod.KeyWithPassphrase &&
@@ -597,6 +604,47 @@ fun TerminalScreen(
             }
         } else {
             openOrPrompt(spec)
+        }
+    }
+
+    val retryConnection: () -> Unit = {
+        showPassphrasePrompt = false
+        pendingTabSpec = null
+        pendingReconnect = null
+        passphraseInput = ""
+        passphraseFromPicker = false
+        pickerScope.launch(Dispatchers.IO) {
+            val prepared = vm.prepareReconnect() ?: return@launch
+            withContext(Dispatchers.Main) {
+                if (vm.activeTabId.value != prepared.tabId) return@withContext
+                val reconnectOrPrompt: () -> Unit = {
+                    if (prepared.spec.authMethod == AuthMethod.KeyWithPassphrase &&
+                        prepared.spec.keyPassphrase.isBlank()
+                    ) {
+                        pendingReconnect = prepared
+                        pendingTabSpec = prepared.spec
+                        passphraseFromPicker = true
+                        showPassphrasePrompt = true
+                    } else {
+                        vm.reconnectPrepared(prepared)
+                    }
+                }
+                if (prepared.requiresVerification) {
+                    requireUserVerification(
+                        context = context,
+                        title = "Verify to connect",
+                        subtitle = "Authenticate to open this server session",
+                    ) { result ->
+                        if (result == VerificationResult.Success &&
+                            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                        ) {
+                            reconnectOrPrompt()
+                        }
+                    }
+                } else {
+                    reconnectOrPrompt()
+                }
+            }
         }
     }
 
@@ -654,13 +702,14 @@ fun TerminalScreen(
         showPassphrasePrompt = false
         passphraseInput = ""
         pendingTabSpec = null
+        pendingReconnect = null
         passphraseFromPicker = false
         if (hostId == null || openLocalShell) return@LaunchedEffect
-        val existing = vm.selectTabForHost(hostId)
+        val prepared = vm.prepareTabOpenForHost(hostId) ?: return@LaunchedEffect
+        val existing = vm.selectTabForHost(hostId, prepared.spec)
         if (existing != null) {
             return@LaunchedEffect
         }
-        val prepared = vm.prepareTabOpenForHost(hostId) ?: return@LaunchedEffect
         vm.refreshTailscaleStatus()
         // Biometric verification already happened in ApplicationNavController
         // before navigating to this route — skip the redundant re-prompt.
@@ -715,7 +764,10 @@ fun TerminalScreen(
                 showPassphrasePrompt = false
                 if (spec != null) {
                     val preparedSpec = spec.copy(keyPassphrase = passphraseInput)
-                    if (preparedSpec.usesRuntimeMultiplexer) {
+                    val reconnect = pendingReconnect
+                    if (reconnect != null) {
+                        vm.reconnectPrepared(reconnect.copy(spec = preparedSpec))
+                    } else if (preparedSpec.usesRuntimeMultiplexer) {
                         vm.initiateMultiplexerOpen(preparedSpec)
                     } else {
                         vm.openTab(preparedSpec)
@@ -723,12 +775,14 @@ fun TerminalScreen(
                 }
                 passphraseInput = ""
                 pendingTabSpec = null
+                pendingReconnect = null
                 passphraseFromPicker = false
             },
             onDismiss = {
                 showPassphrasePrompt = false
                 passphraseInput = ""
                 pendingTabSpec = null
+                pendingReconnect = null
                 if (!passphraseFromPicker) {
                     onBack()
                 }
@@ -826,14 +880,14 @@ fun TerminalScreen(
                                 message = errorMessage,
                                 isMultiplexerPreflight = preflightError != null,
                                 dismissMultiplexerLabel = if (multiplexerState.reconnectRecovery) "dismiss" else "back",
-                                onRetryMultiplexer = vm::retryPendingMultiplexerOpen,
+                                onRetryMultiplexer = if (multiplexerState.reconnectRecovery) retryConnection else vm::retryPendingMultiplexerOpen,
                                 onConnectWithoutMultiplexer = {
                                     if (vm.connectPendingWithoutMultiplexer()) {
                                         vm.selectConnectionTab(ConnectionTab.Terminal)
                                     }
                                 },
                                 onBack = { vm.dismissMultiplexerRecovery(onBack) },
-                                onReconnect = vm::reconnect,
+                                onReconnect = retryConnection,
                             )
                         } else if (tabs.isEmpty()) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -871,14 +925,14 @@ fun TerminalScreen(
                             message = errorMessage,
                             isMultiplexerPreflight = preflightError != null,
                             dismissMultiplexerLabel = if (multiplexerState.reconnectRecovery) "dismiss" else "back",
-                            onRetryMultiplexer = vm::retryPendingMultiplexerOpen,
+                            onRetryMultiplexer = if (multiplexerState.reconnectRecovery) retryConnection else vm::retryPendingMultiplexerOpen,
                             onConnectWithoutMultiplexer = {
                                 if (vm.connectPendingWithoutMultiplexer()) {
                                     vm.selectConnectionTab(ConnectionTab.Terminal)
                                 }
                             },
                             onBack = { vm.dismissMultiplexerRecovery(onBack) },
-                            onReconnect = vm::reconnect,
+                            onReconnect = retryConnection,
                         )
                     }
                 }

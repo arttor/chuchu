@@ -16,6 +16,8 @@ data class TabSpec(
     val publicKeyOpenSsh: String = "",
     val privateKeyPem: String = "",
     val keyPassphrase: String = "",
+    // A prompted passphrase must not make an unchanged saved profile look edited.
+    val savedKeyPassphrase: String = keyPassphrase,
     val transport: Transport = Transport.SSH,
     val postConnectCommand: String? = null,
     val multiplexer: MultiplexerType? = null,
@@ -51,12 +53,23 @@ data class TabSpec(
                 transport != Transport.Mosh &&
                 transport != Transport.LocalShell
 
+    fun matchesSavedProfile(saved: TabSpec): Boolean =
+        copy(
+            keyPassphrase = savedKeyPassphrase,
+            multiplexerSessionName = null,
+            multiplexerCreateIfMissing = true,
+        ) == saved.copy(
+            keyPassphrase = saved.savedKeyPassphrase,
+            multiplexerSessionName = null,
+            multiplexerCreateIfMissing = true,
+        )
+
     companion object {
         fun fromHostProfile(
             host: HostProfile,
             publicKeyOpenSsh: String = "",
             privateKeyPem: String = "",
-            keyPassphrase: String = "",
+            keyPassphrase: String = host.keyPassphrase,
         ): TabSpec = TabSpec(
             hostId = host.id,
             displayName = host.name,
@@ -65,6 +78,7 @@ data class TabSpec(
             username = host.username,
             password = host.password,
             authMethod = host.authMethod,
+            savedKeyPassphrase = host.keyPassphrase,
             publicKeyOpenSsh = publicKeyOpenSsh,
             privateKeyPem = privateKeyPem,
             keyPassphrase = keyPassphrase,
