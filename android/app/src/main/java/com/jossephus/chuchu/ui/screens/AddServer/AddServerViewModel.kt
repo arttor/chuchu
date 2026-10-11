@@ -29,15 +29,23 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class AddServerViewModel(application: Application, private val hostId: Long?) :
+class AddServerViewModel(
+    application: Application,
+    private val hostId: Long?,
+    val isCopy: Boolean = false,
+) :
     AndroidViewModel(application) {
     companion object {
-        fun factory(application: Application, hostId: Long?): ViewModelProvider.Factory =
+        fun factory(
+            application: Application,
+            hostId: Long?,
+            isCopy: Boolean = false,
+        ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
                     if (modelClass.isAssignableFrom(AddServerViewModel::class.java)) {
                         @Suppress("UNCHECKED_CAST")
-                        return AddServerViewModel(application, hostId) as T
+                        return AddServerViewModel(application, hostId, isCopy) as T
                     }
                     throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
                 }
@@ -73,24 +81,7 @@ class AddServerViewModel(application: Application, private val hostId: Long?) :
             viewModelScope.launch {
                 val profile = hostRepository.getById(hostId) ?: return@launch
                 val key = profile.keyId?.let { sshKeyRepository.getById(it) }
-                _form.value =
-                    AddServerForm(
-                        id = profile.id,
-                        name = profile.name,
-                        host = profile.host,
-                        port = profile.port.toString(),
-                        username = profile.username,
-                        password = profile.password,
-                        keyId = profile.keyId,
-                        privateKeyPem = key?.privateKeyPem ?: "",
-                        publicKeyOpenSsh = key?.publicKeyOpenSsh ?: "",
-                        keyPassphrase = profile.keyPassphrase,
-                        transport = profile.transport,
-                        authMethod = profile.authMethod,
-                        requireAuthOnConnect = profile.requireAuthOnConnect,
-                        postConnectCommand = profile.postConnectCommand.orEmpty(),
-                        multiplexer = profile.multiplexer,
-                    )
+                _form.value = profile.toAddServerForm(key, isCopy)
             }
         }
     }
@@ -266,32 +257,12 @@ class AddServerViewModel(application: Application, private val hostId: Long?) :
     fun save(onComplete: () -> Unit) {
         val current = _form.value
         val host = current.host.filterNot { it.isWhitespace() }
-        val port = current.port.toIntOrNull() ?: 22
         if (!current.canSave() || host.isBlank()) return
         val username = current.username.trim()
         if (username.isBlank()) return
 
         viewModelScope.launch {
-            val profile =
-                HostProfile(
-                    id = current.id ?: 0L,
-                    name = current.name.trim(),
-                    host = host,
-                    port = port,
-                    username = username,
-                    password = current.password,
-                    keyId = current.keyId,
-                    keyPassphrase = current.keyPassphrase,
-                    transport = current.transport,
-                    authMethod = current.authMethod,
-                    requireAuthOnConnect = current.requireAuthOnConnect,
-                    postConnectCommand = current.postConnectCommand.trim().ifBlank { null },
-                    multiplexer =
-                        current.multiplexer.takeIf {
-                            current.transport != Transport.Mosh && it?.runtimeSupported == true
-                        },
-                )
-            hostRepository.upsert(profile)
+            hostRepository.upsert(current.toHostProfile(isCopy))
             onComplete()
         }
     }
@@ -314,6 +285,46 @@ data class AddServerForm(
     val postConnectCommand: String = "",
     val multiplexer: MultiplexerType? = null,
 )
+
+internal fun HostProfile.toAddServerForm(key: SshKey?, isCopy: Boolean): AddServerForm =
+    AddServerForm(
+        id = if (isCopy) null else id,
+        name = if (isCopy) "$name - copy" else name,
+        host = host,
+        port = port.toString(),
+        username = username,
+        password = password,
+        keyId = keyId,
+        privateKeyPem = key?.privateKeyPem ?: "",
+        publicKeyOpenSsh = key?.publicKeyOpenSsh ?: "",
+        keyPassphrase = keyPassphrase,
+        transport = transport,
+        authMethod = authMethod,
+        requireAuthOnConnect = requireAuthOnConnect,
+        postConnectCommand = postConnectCommand.orEmpty(),
+        multiplexer = multiplexer,
+    )
+
+internal fun AddServerForm.toHostProfile(isCopy: Boolean): HostProfile =
+    HostProfile(
+        id = if (isCopy) 0L else id ?: 0L,
+        name = name.trim(),
+        host = host.filterNot { it.isWhitespace() },
+        port = port.toIntOrNull() ?: 22,
+        username = username.trim(),
+        password = password,
+        keyId = keyId,
+        keyPassphrase = keyPassphrase,
+        transport = transport,
+        authMethod = authMethod,
+        requireAuthOnConnect = requireAuthOnConnect,
+        postConnectCommand = postConnectCommand.trim().ifBlank { null },
+        // A copied profile must retain a persisted legacy value until the user changes it.
+        multiplexer =
+            multiplexer.takeIf {
+                isCopy || (transport != Transport.Mosh && it?.runtimeSupported == true)
+            },
+    )
 
 fun AddServerForm.canSave(): Boolean {
     if (name.isBlank() || host.isBlank() || username.isBlank()) return false

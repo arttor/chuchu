@@ -70,6 +70,7 @@ fun ServerListScreen(
     localShellEnabled: Boolean,
     onOpenLocalShell: () -> Unit,
     onEditServer: (Long) -> Unit,
+    onCopyServer: (Long) -> Unit,
     onConnectServer: (Long) -> Unit,
     onDeleteServer: (Long) -> Unit,
     onOpenSettings: () -> Unit,
@@ -214,6 +215,10 @@ fun ServerListScreen(
                             isSelected = selectedHostId == host.id,
                             onLongPress = { selectedHostId = host.id },
                             onCancelSelection = { selectedHostId = null },
+                            onCopySelection = {
+                                selectedHostId = null
+                                onCopyServer(host.id)
+                            },
                             onDeleteSelection = {
                                 val is_selected_connected = host.id in connectedHostIds
                                 if (is_selected_connected) {
@@ -398,6 +403,7 @@ private fun HostCard(
     isSelected: Boolean,
     onLongPress: () -> Unit,
     onCancelSelection: () -> Unit,
+    onCopySelection: () -> Unit,
     onDeleteSelection: () -> Unit,
     onEdit: () -> Unit,
     onConnect: () -> Unit,
@@ -436,6 +442,14 @@ private fun HostCard(
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                     ) {
                         ChuText("cancel", style = typography.label, color = colors.textSecondary)
+                    }
+                    ChuButton(
+                        onClick = onCopySelection,
+                        variant = ChuButtonVariant.Outlined,
+                        bracketed = true,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        ChuText("copy", style = typography.label, color = colors.textSecondary)
                     }
                     ChuButton(
                         onClick = onDeleteSelection,

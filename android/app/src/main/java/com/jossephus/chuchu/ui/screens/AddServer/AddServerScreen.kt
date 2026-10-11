@@ -76,7 +76,11 @@ fun AddServerScreen(vm: AddServerViewModel, onBack: () -> Unit, modifier: Modifi
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             ChuText("$ ", style = typography.headline, color = colors.textMuted)
             ChuText(
-                if (form.id != null) "edit server" else "add server",
+                when {
+                    vm.isCopy -> "copy server"
+                    form.id != null -> "edit server"
+                    else -> "add server"
+                },
                 style = typography.headline,
             )
         }
@@ -314,6 +318,16 @@ fun AddServerScreen(vm: AddServerViewModel, onBack: () -> Unit, modifier: Modifi
         }
         if (testState.status == ConnectionTestStatus.Error && testState.message != null) {
             ChuText(testState.message ?: "", style = typography.bodySmall, color = colors.error)
+        }
+        if (vm.isCopy) {
+            ChuButton(
+                onClick = onBack,
+                variant = ChuButtonVariant.Ghost,
+                bracketed = true,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                ChuText("cancel", style = typography.label)
+            }
         }
         ChuButton(
             onClick = { vm.save(onBack) },
