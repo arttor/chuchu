@@ -16,6 +16,7 @@ import com.jossephus.chuchu.service.multiplexer.RemoteMultiplexerSession
 import com.jossephus.chuchu.service.ssh.TailscaleStatusChecker
 import com.jossephus.chuchu.service.terminal.HostKeyPrompt
 import com.jossephus.chuchu.service.terminal.SessionState
+import com.jossephus.chuchu.service.terminal.SessionStatus
 import com.jossephus.chuchu.service.terminal.TabSession
 import com.jossephus.chuchu.service.terminal.TabSpec
 import com.jossephus.chuchu.service.terminal.TerminalMouseAction
@@ -48,6 +49,17 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+internal fun matchingSavedTabIndex(
+    specs: List<TabSpec>,
+    activeIndex: Int,
+    savedSpec: TabSpec,
+): Int? {
+    if (activeIndex in specs.indices && specs[activeIndex].matchesSavedProfile(savedSpec)) {
+        return activeIndex
+    }
+    return specs.indices.lastOrNull { specs[it].matchesSavedProfile(savedSpec) }
+}
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TerminalViewModel(application: Application) : AndroidViewModel(application) {
@@ -107,11 +119,14 @@ class TerminalViewModel(application: Application) : AndroidViewModel(application
             }
             .stateIn(viewModelScope, SharingStarted.Eagerly, FileBrowserUiState())
 
-    fun selectTabForHost(hostId: Long?): TabSession? {
+    fun selectTabForHost(hostId: Long, savedSpec: TabSpec): TabSession? {
         val existing = sessionRepository.tabsForHost(hostId)
         if (existing.isEmpty()) return null
         val activeId = sessionRepository.activeTabId.value
-        val target = existing.firstOrNull { it.id == activeId } ?: existing.last()
+        val activeIndex = existing.indexOfFirst { it.id == activeId }
+        val targetIndex = matchingSavedTabIndex(existing.map { it.spec }, activeIndex, savedSpec)
+            ?: return null
+        val target = existing[targetIndex]
         sessionRepository.selectTab(target.id)
         return target
     }
@@ -153,6 +168,47 @@ class TerminalViewModel(application: Application) : AndroidViewModel(application
         val requiresVerification =
             settingsRepository.requireAuthOnConnect.value || host.requireAuthOnConnect
         return PreparedTabOpen(spec = spec, requiresVerification = requiresVerification)
+    }
+
+    data class PreparedReconnect(
+        val tabId: String,
+        val spec: TabSpec,
+        val requiresVerification: Boolean,
+    )
+
+    suspend fun prepareReconnect(): PreparedReconnect? {
+        val tab = sessionRepository.activeTab.value ?: return null
+        val hostId = tab.spec.hostId
+        if (hostId == null) {
+            return PreparedReconnect(
+                tab.id,
+                tab.spec,
+                settingsRepository.requireAuthOnConnect.value,
+            )
+        }
+        val prepared = prepareTabOpenForHost(hostId) ?: return null
+        val spec = if (tab.spec.matchesSavedProfile(prepared.spec)) {
+            prepared.spec.copy(
+                multiplexerSessionName = tab.spec.multiplexerSessionName,
+                multiplexerCreateIfMissing = tab.spec.multiplexerCreateIfMissing,
+            )
+        } else {
+            prepared.spec
+        }
+        return PreparedReconnect(tab.id, spec, prepared.requiresVerification)
+    }
+
+    fun reconnectPrepared(prepared: PreparedReconnect) {
+        if (!canReconnectTab(prepared.tabId)) return
+        val tab = sessionRepository.tabs.value.firstOrNull { it.id == prepared.tabId } ?: return
+        if (prepared.spec.usesRuntimeMultiplexer) {
+            beginMultiplexerAction(PendingMultiplexerAction.Reconnect(tab.id, prepared.spec))
+        } else {
+            pendingMultiplexerAction = null
+            multiplexerActionGeneration += 1
+            _multiplexerState.value = MultiplexerUiState()
+            reconnectTabWithSpec(tab.id, prepared.spec)
+        }
     }
 
     fun duplicateActiveTab(): TabSession? {
@@ -200,10 +256,6 @@ class TerminalViewModel(application: Application) : AndroidViewModel(application
         beginMultiplexerAction(PendingMultiplexerAction.Open(spec))
     }
 
-    private fun initiateMultiplexerReconnect(tab: TabSession) {
-        beginMultiplexerAction(PendingMultiplexerAction.Reconnect(tab.id, tab.spec))
-    }
-
     private fun beginMultiplexerAction(action: PendingMultiplexerAction) {
         val actionGeneration = ++multiplexerActionGeneration
         val preparedAction = when (action) {
@@ -244,6 +296,14 @@ class TerminalViewModel(application: Application) : AndroidViewModel(application
             }
             withContext(Dispatchers.Main) {
                 if (!isCurrentMultiplexerAction(actionGeneration, preparedAction)) return@withContext
+                if (preparedAction is PendingMultiplexerAction.Reconnect &&
+                    !canReconnectTab(preparedAction.tabId)
+                ) {
+                    pendingMultiplexerAction = null
+                    multiplexerActionGeneration += 1
+                    _multiplexerState.value = MultiplexerUiState()
+                    return@withContext
+                }
                 result.fold(
                     onSuccess = { sessionName ->
                         completeMultiplexerAction(actionGeneration, preparedAction, sessionName)
@@ -288,11 +348,19 @@ class TerminalViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun reconnectTabWithSpec(tabId: String, spec: TabSpec): Boolean {
+        if (!canReconnectTab(tabId)) return false
         val tab = sessionRepository.tabs.value.firstOrNull { it.id == tabId } ?: return false
         refreshTailscaleStatus()
         tab.spec = spec
         sessionRepository.reconnectTab(tab)
         return true
+    }
+
+    private fun canReconnectTab(tabId: String): Boolean {
+        if (sessionRepository.activeTabId.value != tabId) return false
+        val tab = sessionRepository.tabs.value.firstOrNull { it.id == tabId } ?: return false
+        return tab.sessionState.value.status == SessionStatus.Disconnected ||
+            tab.sessionState.value.status == SessionStatus.Error
     }
 
     fun listMultiplexerSessionsForCurrentHost() {
@@ -426,16 +494,6 @@ class TerminalViewModel(application: Application) : AndroidViewModel(application
         fileBrowserResolverJobs.remove(id)?.cancel()
         fileBrowserRefreshJobs.remove(id)?.cancel()
         sessionRepository.closeTab(id)
-    }
-
-    fun reconnect() {
-        refreshTailscaleStatus()
-        val tab = sessionRepository.activeTab.value ?: return
-        if (tab.spec.usesRuntimeMultiplexer) {
-            initiateMultiplexerReconnect(tab)
-        } else {
-            sessionRepository.reconnectActive()
-        }
     }
 
     fun selectConnectionTab(tab: ConnectionTab) {
