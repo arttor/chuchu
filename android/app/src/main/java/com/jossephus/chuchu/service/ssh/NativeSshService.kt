@@ -108,6 +108,7 @@ class NativeSshService(
         publicKeyOpenSsh: String = "",
         privateKeyPem: String = "",
         keyPassphrase: String = "",
+        verificationHost: String = host,
     ) {
         require(bridge.isLoaded()) { "Native SSH unavailable: ${bridge.nativeStatus()}" }
         close()
@@ -126,7 +127,7 @@ class NativeSshService(
         val keyBytes =
             bridge.nativeGetHostKey(handle)
                 ?: throw IllegalStateException("Missing server host key")
-        if (!hostKeyPolicy.verify(host, port, algorithm, keyBytes)) {
+        if (!hostKeyPolicy.verify(verificationHost, port, algorithm, keyBytes)) {
             throw IllegalStateException("Host key rejected")
         }
 

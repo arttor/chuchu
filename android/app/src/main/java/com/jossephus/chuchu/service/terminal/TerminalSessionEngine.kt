@@ -6,6 +6,7 @@ import com.jossephus.chuchu.model.AuthMethod
 import com.jossephus.chuchu.model.MultiplexerType
 import com.jossephus.chuchu.model.Transport
 import com.jossephus.chuchu.service.mosh.MoshBootstrapParser
+import com.jossephus.chuchu.service.mosh.MoshEndpointResolver
 import com.jossephus.chuchu.service.mosh.MoshEventType
 import com.jossephus.chuchu.service.mosh.MoshReconnectPolicy
 import com.jossephus.chuchu.service.mosh.MoshState
@@ -29,6 +30,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -130,6 +132,7 @@ class TerminalSessionEngine(
     private var pendingColorScheme: Int? = null
     private var pendingDefaultColors: DefaultColors? = null
     private var lastConnectionParams: ConnectionParams? = null
+    private var connectJob: Job? = null
     private var reconnectJob: Job? = null
     private var disconnectRequested = false
 
@@ -189,7 +192,8 @@ class TerminalSessionEngine(
                 multiplexerCreateIfMissing = multiplexerCreateIfMissing,
             )
         lastConnectionParams = params
-        scope.launch(dispatcher) {
+        connectJob?.cancel()
+        connectJob = scope.launch(dispatcher) {
             reconnectJob?.cancel()
             reconnectJob = null
             _state.value =
@@ -256,6 +260,7 @@ class TerminalSessionEngine(
             }
             try {
                 establishConnection(params, username)
+                currentCoroutineContext().ensureActive()
                 _state.value =
                     _state.value.copy(
                         status = SessionStatus.Connected,
@@ -266,6 +271,8 @@ class TerminalSessionEngine(
                 requestSnapshot(force = true)
                 startReadLoop()
                 sendStartupCommand(params)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: LinkageError) {
                 Log.e("TerminalSession", "Connect failed", e)
                 _state.value =
@@ -577,6 +584,8 @@ class TerminalSessionEngine(
 
     fun disconnect() {
         disconnectRequested = true
+        connectJob?.cancel()
+        connectJob = null
         reconnectJob?.cancel()
         reconnectJob = null
         lastConnectionParams = null
@@ -873,8 +882,15 @@ class TerminalSessionEngine(
     private suspend fun establishMoshConnection(params: ConnectionParams, username: String) {
         Log.d("TerminalSession", "MOSH: Phase 1 — SSH bootstrap start")
         check(nativeSsh.isAvailable()) { "Native SSH unavailable for mosh bootstrap" }
+        val endpointHost = withContext(Dispatchers.IO) { MoshEndpointResolver.resolve(params.host) }
+        Log.d(
+            "TerminalSession",
+            "MOSH: Resolved endpoint host=$endpointHost from profile host=${params.host}",
+        )
         nativeSsh.connect(
-            host = params.host,
+            host = endpointHost,
+            // Keep existing known-host entries and prompts keyed to the saved profile name.
+            verificationHost = params.host,
             port = params.port,
             username = username,
             authMethod = params.authMethod,
@@ -883,6 +899,7 @@ class TerminalSessionEngine(
             privateKeyPem = params.privateKeyPem,
             keyPassphrase = params.keyPassphrase,
         )
+        currentCoroutineContext().ensureActive()
         // Use exec channel to bypass shell init noise and MOTD.
         // Falls back to shell if the remote server doesn't support exec.
         val moshCommand = MoshReconnectPolicy.bootstrapCommand()
@@ -905,12 +922,14 @@ class TerminalSessionEngine(
         suspend fun readBootstrapWindow(timeoutMs: Long): Boolean {
             val deadline = System.currentTimeMillis() + timeoutMs
             while (System.currentTimeMillis() < deadline) {
+                currentCoroutineContext().ensureActive()
                 val chunk = nativeSsh.read(4096)
                 if (chunk != null && chunk.isNotEmpty()) {
                     val text = String(chunk, Charsets.UTF_8)
                     outputBuffer.append(text)
-                    val result = MoshBootstrapParser.parse(params.host, outputBuffer.toString())
+                    val result = MoshBootstrapParser.parse(endpointHost, outputBuffer.toString())
                     if (result is MoshBootstrapParser.ParseResult.Success) {
+                        currentCoroutineContext().ensureActive()
                         Log.d(
                             "TerminalSession",
                             "MOSH: Parsed endpoint host=${result.endpoint.host} port=${result.endpoint.port}",
@@ -1085,6 +1104,7 @@ class TerminalSessionEngine(
                     }
                     try {
                         establishConnection(params, params.username)
+                        currentCoroutineContext().ensureActive()
                         _state.value =
                             _state.value.copy(
                                 status = SessionStatus.Connected,
@@ -1095,6 +1115,8 @@ class TerminalSessionEngine(
                         startReadLoop()
                         sendStartupCommand(params)
                         return@launch
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
                         Log.e("TerminalSession", "Reconnect attempt $attempt failed", e)
                         if (attempt >= 8) {
