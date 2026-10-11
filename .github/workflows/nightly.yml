@@ -14,15 +14,18 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install Nix
+        run: bash .github/install-nix.sh
 
       - name: nix shell
         run: nix develop -L --verbose
@@ -76,12 +79,9 @@ jobs:
             zig build -Doptimize=ReleaseSmall -Dtarget=aarch64-linux-android.24 jni
           '
 
-      - name: generate release key
-        run: |
-          cd android/app/ && echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > key.jks
-
       - name: build android release APK
         env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
@@ -89,36 +89,52 @@ jobs:
           VERSION_NAME: ${{ steps.version.outputs.version_name }}
           ANDROID_ABI_FILTERS: arm64-v8a
         run: |
+          set -euo pipefail
+          umask 077
+          trap 'rm -f android/app/key.jks' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/key.jks
           nix develop -c bash -c '
-            set -e
+            set -euo pipefail
             cd android
             chmod +x ./gradlew
             if [ -f local.properties ]; then chmod -w local.properties; fi
-            ./gradlew assembleRelease
+            ./gradlew testDebugUnitTest lintDebug assembleRelease
           '
 
       - name: name APK artifact
         id: apk
         run: |
           set -euo pipefail
-          SRC="$(ls ./android/app/build/outputs/apk/release/*.apk | head -n1)"
+          shopt -s nullglob
+          apks=(./android/app/build/outputs/apk/release/*.apk)
+          if (( ${#apks[@]} != 1 )); then
+            echo '::error::Expected exactly one nightly APK'
+            exit 1
+          fi
+          SRC="${apks[0]}"
           DEST="./android/app/build/outputs/apk/release/chuchu-nightly.apk"
           cp "$SRC" "$DEST"
           echo "path=${DEST}" >> "$GITHUB_OUTPUT"
 
       - name: build release notes
         id: notes
+        env:
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           NOTES="$(mktemp)"
           {
             echo "### Chuchu nightly"
             echo
-            echo "Automated build from \`main\` (\`${{ steps.version.outputs.short_sha }}\`)."
+            echo "Automated build from \`main\` (\`${SHORT_SHA}\`)."
             echo
-            echo "- **versionName:** \`${{ steps.version.outputs.version_name }}\`"
-            echo "- **versionCode:** \`${{ steps.version.outputs.version_code }}\`"
-            echo "- **commit:** https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
+            echo "- **versionName:** \`${VERSION_NAME}\`"
+            echo "- **versionCode:** \`${VERSION_CODE}\`"
+            echo "- **commit:** https://github.com/${REPOSITORY}/commit/${COMMIT_SHA}"
             echo
             echo "#### Recent commits"
             echo
@@ -128,22 +144,35 @@ jobs:
           echo "path=${NOTES}" >> "$GITHUB_OUTPUT"
 
       - name: retarget rolling nightly tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f nightly "${{ github.sha }}"
-          git push origin refs/tags/nightly --force
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/nightly" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref=refs/tags/nightly -f sha="$GITHUB_SHA" >/dev/null
+          fi
 
       - name: publish rolling nightly release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          target_commitish: ${{ github.sha }}
-          name: Nightly ${{ steps.version.outputs.date_utc }} (${{ steps.version.outputs.short_sha }})
-          body_path: ${{ steps.notes.outputs.path }}
-          prerelease: true
-          make_latest: "false"
-          files: ${{ steps.apk.outputs.path }}
-          fail_on_unmatched_files: true
-          overwrite_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATE_UTC: ${{ steps.version.outputs.date_utc }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+          NOTES_PATH: ${{ steps.notes.outputs.path }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          test -f "$APK_PATH"
+          TITLE="Nightly $DATE_UTC ($SHORT_SHA)"
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "$TITLE" --notes-file "$NOTES_PATH" \
+              --prerelease --latest=false --target "$GITHUB_SHA"
+            gh release upload nightly "$APK_PATH" --clobber
+          else
+            gh release create nightly "$APK_PATH" --verify-tag --title "$TITLE" \
+              --notes-file "$NOTES_PATH" --prerelease --latest=false \
+              --target "$GITHUB_SHA"
+          fi
